@@ -1,209 +1,191 @@
 # visual_model.py
-
 import torch
 import torch.nn as nn
 import timm
-from models.pet_modules import AdaptFormer
 import torch.nn.functional as F
+from models.pet_modules import AdaptFormer
+
 
 class PointCloudEncoder(nn.Module):
+    """
+    Simple CNN-based encoder that takes a pseudo-image [B, 3, H, W]
+    and produces a single [B, dim] descriptor.
+    """
     def __init__(self, dim):
         super(PointCloudEncoder, self).__init__()
 
-        # Convolutional layers to process the pseudo-image
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)  # Input: 3 channels
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv2d(3,   64,  kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(64,  128, kernel_size=3, stride=1, padding=1)
         self.conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
         self.conv4 = nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1)
 
-        # Update the fully connected layer to match the flattened size
-        self.fc = nn.Linear(512 * 14 * 14, 768)  # Changed from 512*16*16 to 512*14*14
-
-        # Batch normalization layers
-        #self.bn1 = nn.InstanceNorm2d(64, affine=True)
         self.bn1 = nn.GroupNorm(num_groups=8, num_channels=64)
-
         self.bn2 = nn.BatchNorm2d(128)
         self.bn3 = nn.BatchNorm2d(256)
         self.bn4 = nn.BatchNorm2d(512)
 
-        # Dropout for regularization
+        # After final pooling, we will adaptively pool to 14x14, then flatten -> 512 * 14 * 14.
+        self.fc = nn.Linear(512 * 14 * 14, dim)
+
         self.dropout = nn.Dropout(0.5)
 
     def forward(self, x):
-        # print(f"Input to PointCloudEncoder: {x.shape}")
-
+        # x shape: [B, 3, H, W]
         x = F.relu(self.bn1(self.conv1(x)))
-        # print(f"After conv1: {x.shape}")
         x = F.max_pool2d(x, 2)
-        # print(f"After pool1: {x.shape}")
-        
+
         x = F.relu(self.bn2(self.conv2(x)))
-        # print(f"After conv2: {x.shape}")
         x = F.max_pool2d(x, 2)
-        # print(f"After pool2: {x.shape}")
 
         x = F.relu(self.bn3(self.conv3(x)))
-        # print(f"After conv3: {x.shape}")
         x = F.max_pool2d(x, 2)
-        # print(f"After pool3: {x.shape}")
 
         x = F.relu(self.bn4(self.conv4(x)))
-        # print(f"After conv4: {x.shape}")
         x = F.max_pool2d(x, 2)
-        # print(f"After pool4: {x.shape}")
 
-        # Now we adaptively pool to 14x14, regardless of input size.
-        x = F.adaptive_avg_pool2d(x, (14, 14))
-        # print(f"After adaptive_avg_pool2d: {x.shape}")  # [B, 512, 14, 14]
-
-        # Flatten once
-        x = x.flatten(start_dim=1)  # [B, 512 * 14 * 14]
-        # print(f"After flatten: {x.shape}")
-
-        # self.fc = nn.Linear(512 * 14 * 14, 768)
-
-        # Pass through the fully connected layer
-        x = self.fc(x)  # [B, dim]
-        # print(f"After fc: {x.shape}")
-
-        # Apply dropout for regularization
+        # Force 14x14 via adaptive pooling
+        x = F.adaptive_avg_pool2d(x, (14, 14))    # [B, 512, 14, 14]
+        x = x.flatten(start_dim=1)                # [B, 512*14*14]
+        x = self.fc(x)                            # [B, dim]
         x = self.dropout(x)
-
         return x
 
+
 class AVmodel(nn.Module):
-    def __init__(self, num_classes, num_latents, dim):
+    """
+    Multimodal model that:
+      - Uses a ViT patch embedding (from timm) for RGB,
+      - Uses a CNN-based pseudo-image encoder for LiDAR,
+      - Fuses them with a stack of AdaptFormer blocks,
+      - Outputs classification logits.
+    """
+    def __init__(self, num_classes, num_latents, dim=768):
         super(AVmodel, self).__init__()
 
-        # RGB Vision Transformer (ViT)
+        # 1) RGB encoder (using timm's ViT patch embedding)
         self.v2 = timm.create_model('vit_base_patch16_224', pretrained=True)
-
-        # Remove unnecessary layers for RGB processing
         self.v2.pre_logits = nn.Identity()
-        self.v2.head = nn.Identity()
+        self.v2.head       = nn.Identity()
+        # We won't use self.v2.blocks here, because we do custom fusion.
+        # But we keep self.v2.patch_embed, self.v2.cls_token, self.v2.pos_embed, etc.
 
-        # Initialize Point Cloud Encoder
+        # 2) PC encoder
         self.pc_encoder = PointCloudEncoder(dim=dim)
 
-        # Define Transformer blocks (AdaptFormer without encoders)
+        # 3) Stacked AdaptFormer blocks for cross-modality fusion
         encoder_layers = []
-        for i in range(12):
-            encoder_layers.append(
-                AdaptFormer(
-                    num_latents=num_latents,
-                    dim=768
-                )
-            )
+        for _ in range(12):
+            encoder_layers.append(AdaptFormer(num_latents=num_latents, dim=dim))
         self.pointcloud_rgb_blocks = nn.Sequential(*encoder_layers)
 
-        # Final normalization layers for both RGB and Point Cloud Encoders
-        self.rgb_post_norm = self.v2.norm
+        # 4) Final norm for both streams (reuse the ViT norm, which is LN)
+        self.post_norm = self.v2.norm  # LayerNorm over dim=768
 
-        # Classifier head for classification
-        self.classifier = nn.Sequential(
-            nn.Linear(dim, num_classes)
-        )
+        # 5) Classifier head
+        self.classifier = nn.Linear(dim, num_classes)
 
     def forward_pc_features(self, pc):
-        # Process pseudo-image LiDAR data through the PointCloudEncoder
-        pc = self.pc_encoder(pc)  # [B, dim]
-        # # print(f"AVmodel - PC Features after Encoder: {pc.shape}")
+        """
+        pc: [B, 3, H, W]
+        Returns: [B, dim]
+        """
+        pc = self.pc_encoder(pc)
         return pc
 
     def forward_rgb_features(self, x):
-        # Ensure input is 5D: (batch_size, no_of_frames, channels, height, width)
-        if len(x.shape) != 5:
-            raise ValueError(f"Expected input of shape (B, no_of_frames, C, H, W), but got {x.shape}")
-        
-        B, no_of_frames, C, H, W = x.shape
+        """
+        x: [B, T, 3, H, W]
+           (B = batch size, T = number of frames, 3 = channels, H/W = 224)
+        Returns a token sequence of shape [B, 1 + (T*patches), dim].
+        """
+        if x.dim() != 5:
+            raise ValueError(f"Expected 5D input (B, T, C, H, W), got {x.shape}")
 
-        # Flatten batch and frames for patch embedding
-        x = x.reshape(B * no_of_frames, C, H, W)
+        B, T, C, H, W = x.shape
+        # Flatten frames into batch dimension
+        x = x.reshape(B * T, C, H, W)  # => [B*T, 3, H, W]
 
-        # Pass through patch embedding
-        x = self.v2.patch_embed(x)  # Shape: (batch_size * no_of_frames, num_patches, embed_dim)
+        # Patch embedding
+        # result shape: [B*T, num_patches, dim], typically [B*T, 196, 768] for 224x224 and patch16
+        x = self.v2.patch_embed(x)
 
-        if len(x.shape) != 3:  # Check for 3D output
-            raise ValueError(f"Expected 3D output from patch embedding, but got {x.shape}")
-        
-        # Unpack the output shape
-        _, num_patches, dim = x.shape
+        # Reshape back to [B, T * num_patches, dim]
+        x = x.reshape(B, -1, x.shape[-1])  # => [B, T*num_patches, dim]
 
-        # Reshape back to include frames
-        x = x.reshape(B, no_of_frames, num_patches, dim)
+        # Prepend CLS token
+        cls_token = self.v2.cls_token.expand(B, -1, -1)   # => [B, 1, dim]
+        x = torch.cat([cls_token, x], dim=1)              # => [B, 1 + T*num_patches, dim]
 
-        # Flatten spatial and temporal dimensions
-        x = x.permute(0, 3, 1, 2).reshape(B, dim, -1).permute(0, 2, 1)  # Shape: (B, no_of_tokens, dim)
-        # print(f"AVmodel - RGB Features after Patch Embed and Reshape: {x.shape}")
+        # Split the official pos_embed into cls_pos + patch_pos
+        # v2.pos_embed: [1, 1 + 196, dim] = [1, 197, dim] for base_patch16_224
+        pos_embed   = self.v2.pos_embed  # shape: [1, 1 + patch_count, dim]
+        cls_pos     = pos_embed[:, 0:1, :]   # => [1, 1, dim]
+        patch_pos   = pos_embed[:, 1:, :]    # => [1, patch_count, dim]
 
-        # Add class token
-        cls_token = self.v2.cls_token.expand(B, -1, -1)  # [B,1,dim]
-        x = torch.cat((cls_token, x), dim=1)  # [B, 1 + no_of_tokens, dim]
-        # print(f"AVmodel - RGB Features after Adding Class Token: {x.shape}")
-
-        # Add positional embeddings
-        '''
-        
-        pos_embed = self.v2.pos_embed.permute(0, 2, 1)  # [B, dim, seq_len]
-        if pos_embed.shape[1] != x.shape[1]:
-            pos_embed = nn.functional.interpolate(pos_embed, size=x.shape[1], mode="linear")
-        x = x + pos_embed.permute(0, 2, 1)  # [B, 1 + no_of_tokens, dim]
-        '''
-        # print(f"AVmodel - RGB Features after Adding Positional Embeddings: {x.shape}")
-
-            # Original pos_embed is [1, num_tokens, dim]
-        pos_embed = self.v2.pos_embed  # shape: [1, N, dim]
-        if pos_embed.shape[1] != x.shape[1]:
-            # Interpolate along the token dimension:
-            pos_embed = nn.functional.interpolate(
-                pos_embed.transpose(1, 2),  # [1, dim, N]
-                size=x.shape[1],
-                mode="linear",
+        # If the user has T frames, total patches = T * patch_count_per_frame
+        # We need to interpolate the patch portion accordingly.
+        # The 'cls_pos' is never interpolated; it always remains one token.
+        actual_patches = x.shape[1] - 1  # total patch tokens (T * patch_count_per_frame)
+        if patch_pos.shape[1] != actual_patches:
+            patch_pos = nn.functional.interpolate(
+                patch_pos.transpose(1, 2),  # => [1, dim, patch_count]
+                size=actual_patches,
+                mode='linear',
                 align_corners=False
-            ).transpose(1, 2)  # back to [1, new_N, dim]
-        x = x + pos_embed
+            ).transpose(1, 2)  # => [1, new_patch_count, dim]
 
+        # Now add them
+        x[:, 0:1, :]    = x[:, 0:1, :] + cls_pos  # add cls_pos
+        x[:, 1:, :]     = x[:, 1:, :] + patch_pos
 
-        return x  # [B, 1 + num_tokens, dim]
+        return x  # shape: [B, 1 + T*patch_count, dim]
 
     def forward_encoder(self, pc, rgb):
-        # Ensure pc has shape [B, 1, dim]
-        pc = pc.unsqueeze(1)  # [B, 1, dim]
-        # print(f"AVmodel - PC Features after Unsqueeze: {pc.shape}")
+        """
+        pc:  [B, 1, dim]
+        rgb: [B, N, dim]
+        => Runs them through the 12 AdaptFormer blocks, then final LN, returns
+           single token per stream => [B, dim], [B, dim]
+        """
+        # Expand pc to have "sequence length = 1"
+        pc = pc.unsqueeze(1)  # => [B, 1, dim]
 
-        for idx, blk in enumerate(self.pointcloud_rgb_blocks):
-            # print(f"AVmodel - Processing AdaptFormer Block {idx + 1}")
+        # AdaptFormer blocks
+        for blk in self.pointcloud_rgb_blocks:
             pc, rgb = blk(pc, rgb)
-            # print(f"AVmodel - After Block {idx + 1}: PC: {pc.shape}, RGB: {rgb.shape}")
 
-        # Post-processing (norm) for both modalities
-        pc = self.rgb_post_norm(pc)  # [B, 1, dim]
-        rgb = self.rgb_post_norm(rgb)  # [B, 1 + num_tokens, dim]
-        # print(f"AVmodel - After Normalization: PC: {pc.shape}, RGB: {rgb.shape}")
+        # Post-norm
+        pc  = self.post_norm(pc)   # => [B, 1, dim]
+        rgb = self.post_norm(rgb)  # => [B, N, dim]
 
-        # Extract class tokens
-        pc = pc[:, 0]  # [B, dim]
-        rgb = rgb[:, 0]  # [B, dim]
-        # print(f"AVmodel - Extracted Class Tokens: PC: {pc.shape}, RGB: {rgb.shape}")
+        # Extract the "class token" from each
+        pc  = pc[:, 0]   # => [B, dim]
+        rgb = rgb[:, 0]  # => [B, dim]
 
         return pc, rgb
 
     def forward(self, pc, rgb):
-        # Process point cloud (pseudo-image) and RGB features
-        pc = self.forward_pc_features(pc)  # [B, dim]
-        if torch.isnan(pc).any():
+        """
+        pc:  [B, 3, H, W]          (LiDAR pseudo-image)
+        rgb: [B, T, 3, 224, 224]   (RGB frames or images)
+        Returns classification logits: [B, num_classes].
+        """
+
+        # 1) Encode point cloud
+        pc_feat = self.forward_pc_features(pc)  # => [B, dim]
+        if torch.isnan(pc_feat).any():
             print("NaN in PC features")
-        rgb = self.forward_rgb_features(rgb)  # [B, 1 + num_tokens, dim]
-        if torch.isnan(rgb).any():
+
+        # 2) Encode RGB
+        rgb_feat = self.forward_rgb_features(rgb)  # => [B, 1 + T*num_patches, dim]
+        if torch.isnan(rgb_feat).any():
             print("NaN in RGB features")
 
-        # Process through the encoder (fusion of modalities)
-        pc, rgb = self.forward_encoder(pc, rgb)  # [B, dim], [B, dim]
+        # 3) Fuse them
+        pc_final, rgb_final = self.forward_encoder(pc_feat, rgb_feat)  # => [B, dim], [B, dim]
 
-        # Combine features from both modalities and classify
-        logits = (pc + rgb) * 0.5  # [B, dim]
-        logits = self.classifier(logits)  # [B, num_classes]
-        # print(f"AVmodel - Logits Shape: {logits.shape}")
+        # 4) Combine and classify
+        fused = 0.5 * (pc_final + rgb_final)  # simple averaging
+        logits = self.classifier(fused)       # => [B, num_classes]
 
         return logits
