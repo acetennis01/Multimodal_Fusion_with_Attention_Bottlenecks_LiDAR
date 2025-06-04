@@ -69,7 +69,8 @@ def run_dataloader_test(dataset_root, split_name, num_samples_to_test=3):
         if dataset_len -1 not in indices_to_test: indices_to_test.append(dataset_len - 1)
     
     indices_to_test = sorted(list(set(indices_to_test)))[:num_samples_to_test]
-
+    
+    count = 0
 
     for i, sample_idx_to_fetch in enumerate(indices_to_test):
         if sample_idx_to_fetch >= dataset_len:
@@ -77,6 +78,8 @@ def run_dataloader_test(dataset_root, split_name, num_samples_to_test=3):
             continue
 
         print(f"--- Testing sample at index: {sample_idx_to_fetch} ---")
+        print(count)
+        count += 1
         try:
             sample = dataset[sample_idx_to_fetch]
 
