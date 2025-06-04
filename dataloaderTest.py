@@ -16,20 +16,6 @@ def run_dataloader_test(dataset_root, split_name, num_samples_to_test=3):
     print(f"Attempting to load dataset from: {dataset_root}")
     print(f"Using split: {split_name}\n")
 
-    # 1. Check for my_pipeline_transforms.py (still useful here as a pre-check)
-    try:
-        importlib.import_module("my_pipeline_transforms")
-        print("SUCCESS: 'my_pipeline_transforms.py' seems to be accessible.")
-        print("         (KITTIDataset will attempt to import 'PointsToPseudoImage' from it).")
-    except ImportError:
-        print("ERROR: Could not import 'my_pipeline_transforms' module.")
-        print("       Please ensure 'my_pipeline_transforms.py' (containing PointsToPseudoImage class)")
-        print("       is in your Python path or the same directory as this script.")
-        print("       The KITTIDataset will likely fail if this is not resolved.")
-        # We can choose to exit here or let KITTIDataset fail later,
-        # for now, we'll proceed and let KITTIDataset handle the direct import error.
-        pass # Proceed to allow KITTIDataset to raise its own error if needed.
-
     # 2. Instantiate Dataloader
     try:
         dataset = KITTIDataset(root_path=dataset_root, split=split_name)
