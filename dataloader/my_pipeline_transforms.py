@@ -1,9 +1,6 @@
 # my_pipeline_transforms.py
 
 import numpy as np
-from mmdet.datasets import PIPELINES
-
-@PIPELINES.register_module()
 class PointsToPseudoImage:
     """Convert raw LiDAR points to a 2D pseudo‐image (toy BEV example)."""
 
