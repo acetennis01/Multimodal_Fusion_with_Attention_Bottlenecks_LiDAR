@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 import torchvision.transforms as transforms
-from my_pipeline_transforms import PointsToPseudoImage 
+from dataloader.my_pipeline_transforms import PointsToPseudoImage 
 class KITTIDataset(Dataset):
     def __init__(self, root_path, split='train', transform=None):
         """
