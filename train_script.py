@@ -11,7 +11,7 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize # For de
 # Ensure these files are in the same directory or your PYTHONPATH
 try:
     from dataloader.kitti_dataset import KITTIDataset
-    from model.visual_model import AVmodel # This file should contain AVmodel, PointCloudEncoder, AdaptFormer, QuickGELU
+    from models.visual_model import AVmodel # This file should contain AVmodel, PointCloudEncoder, AdaptFormer, QuickGELU
 except ImportError as e:
     print(f"Error importing custom modules: {e}")
     print("Please ensure kitti_dataset_module.py and model.py are in the current directory or PYTHONPATH.")
