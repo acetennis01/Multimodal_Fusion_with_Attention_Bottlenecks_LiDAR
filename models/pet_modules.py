@@ -1,7 +1,9 @@
-# pet_modules.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import timm # Make sure timm is installed: pip install timm
 
+# pet_modules.py (contents for AdaptFormer, as you provided)
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
@@ -18,7 +20,7 @@ class AdaptFormer(nn.Module):
         super(AdaptFormer, self).__init__()
 
         self.act = QuickGELU()
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.1) # Consider making dropout rate configurable if needed
         self.dim = dim
 
         # --- Cross-attention scale parameters ---
@@ -50,14 +52,16 @@ class AdaptFormer(nn.Module):
         self.latents = nn.Parameter(torch.empty(1, num_latents, dim).normal_(std=0.02))
 
         # Multi-head attention for cross-attention
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=8, batch_first=False)
+        # Note: MHA default is batch_first=False, so inputs are (S, B, D)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=8) # Removed batch_first=False as it's default
 
     def attention(self, q, k, v):
         """
         Wrapper for the PyTorch MultiheadAttention.
         Shape convention here is [S, B, D] for each of q, k, v.
         """
-        attn_output, attn_weights = self.attn(q, k, v)
+        # attn_output, attn_weights = self.attn(q, k, v, need_weights=False) # Optionally set need_weights
+        attn_output, _ = self.attn(q, k, v) # If weights are not needed
         return attn_output  # [S, B, D]
 
     def fusion(self, pc_tokens, visual_tokens):
@@ -116,7 +120,7 @@ class AdaptFormer(nn.Module):
         x_down = self.act(x_down)
         x_down = self.dropout(x_down)
         x_up   = self.pc_up(x_down)
-        return x_up  # no scale factor here; we apply it on the residual connection
+        return x_up
 
     def forward_visual_AF(self, x):
         """
@@ -141,4 +145,4 @@ class AdaptFormer(nn.Module):
         rgb_out = rgb_fused + self.mlp_scale_rgb * self.forward_visual_AF(rgb_fused)
 
         return pc_out, rgb_out
-
+# End of pet_modules.py content

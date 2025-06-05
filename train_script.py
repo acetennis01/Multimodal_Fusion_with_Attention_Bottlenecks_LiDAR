@@ -1,362 +1,205 @@
 import argparse
-import numpy as np
+import os
+import time
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from dataloader.av_data import KITTIMultiDriveDataset
-from models.visual_model import AVmodel
-import os
-import torchvision
-from torchvision.utils import save_image
-from tqdm import tqdm
-import torchvision.transforms.functional as TF
+from torchvision.transforms import Compose, Resize, ToTensor, Normalize # For default dataset transform
+
+# --- Import your custom modules ---
+# Ensure these files are in the same directory or your PYTHONPATH
+try:
+    from dataloader.kitti_dataset import KITTIDataset
+    from model import AVmodel # This file should contain AVmodel, PointCloudEncoder, AdaptFormer, QuickGELU
+except ImportError as e:
+    print(f"Error importing custom modules: {e}")
+    print("Please ensure kitti_dataset_module.py and model.py are in the current directory or PYTHONPATH.")
+    exit()
+
+try:
+    import dataloader.my_pipeline_transforms # Check if accessible, PointsToPseudoImage is imported within KITTIDataset
+except ImportError as e:
+    print(f"Error: my_pipeline_transforms.py not found or accessible: {e}")
+    print("This file is required by KITTIDataset.")
+    exit()
 
 
-
-def parse_options():
-    parser = argparse.ArgumentParser(description="Multimodal Bottleneck Attention with KITTI Dataset")
-
-    ##### TRAINING DYNAMICS
-    parser.add_argument('--gpu_id', type=str, default="cpu", help='the GPU id')
-    parser.add_argument('--lr', type=float, default=3e-4, help='initial learning rate')
-    parser.add_argument('--batch_size', type=int, default=3, help='batch size')  # Lower default batch size
-    parser.add_argument('--num_epochs', type=int, default=15, help='total training epochs')
-    parser.add_argument('--seed', type=int, default=1111, help='random seed')
-
-    ##### ADAPTER AND LATENT PARAMETERS
-    parser.add_argument('--adapter_dim', type=int, default=768, help='dimension of the low-rank adapter')
-    parser.add_argument('--num_latent', type=int, default=4, help='number of latent tokens')
-    parser.add_argument('--num_classes', type=int, default=7, help='number of output classes')
-
-    ##### DATA
-    parser.add_argument('--data_root', type=str, default='/Users/abhiramannaluru/Documents/data/raw_data_downloader/2011_09_26', help='path to KITTI dataset')
-
-    opts = parser.parse_args()
-    torch.manual_seed(opts.seed)
-
-    opts.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-
-    # if opts.gpu_id.lower() == "cpu" or not torch.cuda.is_available():
-    #     opts.device = torch.device("cpu")
-    # else:
-    #     opts.device = torch.device(f"cuda:{opts.gpu_id}")  # Updated GPU ID handling
-    return opts
-
-def lidar_to_histogram_features(lidar, crop=256):
-    """
-    Convert LiDAR point cloud into 2-bin histogram over 256x256 grid
-    """
-
-    def splat_points(point_cloud):
-        # 256 x 256 grid
-        pixels_per_meter = 16
-        hist_max_per_pixel = 5
-        x_meters_max = 28
-        y_meters_max = 56
-
-        # # Increase the range and shift it to the right
-        # x_start = 0           # start at 0 meters (or a positive offset)
-        # x_end = 100            # extend further to the right
-        # pixels_per_meter = 8
-
-        # xbins = np.linspace(
-        #     x_start,
-        #     x_end,
-        #     (x_end - x_start) * pixels_per_meter + 1,
-        # )
-
-
-        xbins = np.linspace(
-            -4 * x_meters_max,
-            4 * x_meters_max + 1,
-            2 * x_meters_max * pixels_per_meter + 1,
-        )
-        # ybins = np.linspace(-y_meters_max, 0, y_meters_max * pixels_per_meter + 1)
-        ybins = np.linspace(-y_meters_max, y_meters_max, y_meters_max * pixels_per_meter + 1)
-        
-        hist = np.histogramdd(point_cloud[..., :2], bins=(xbins, ybins))[0]
-        hist[hist > hist_max_per_pixel] = hist_max_per_pixel
-        overhead_splat = hist / hist_max_per_pixel
-        return overhead_splat
-
-    below = lidar[lidar[..., 2] <= -2.0]
-    above = lidar[lidar[..., 2] > -2.0]
-    below_features = splat_points(below)
-    above_features = splat_points(above)
-    total_features = below_features + above_features
-    features = np.stack([below_features, above_features, total_features], axis=-1)
-    features = np.transpose(features, (2, 0, 1)).astype(np.float32)  # Shape: (3, H, W)
-    return features
-
-
-'''
-def collate_fn(batch):
-    point_clouds, rgb_frames, timestamps, oxts_data = [], [], [], []
-
-    output_dir = "pseudo_images"
-    
-    i = 0
-
-    
-    for point_cloud, rgb_frame, timestamp, oxts in batch:
-        #print(f"Point cloud shape: {point_cloud.shape}")
-        
-        # Transform the LiDAR point cloud to a pseudo-image
-        pseudo_image = lidar_to_histogram_features(point_cloud)
-        
-        # Print the shape of the pseudo-image before and after adding batch dimension
-        #print(f"Pseudo-image shape (before unsqueeze): {pseudo_image.shape}")
-        
-        # Ensure the pseudo-image has 3 channels (for compatibility with the encoder)
-        # Here we don't use unsqueeze(0) since we're going to stack the images later.
-        pseudo_image = torch.tensor(pseudo_image)  # Shape should be [3, 224, 224]
-        
-        #print(f"Pseudo-image shape (after converting to tensor): {pseudo_image.shape}")
-        
-        point_clouds.append(pseudo_image)
-        rgb_frames.append(rgb_frame)
-        timestamps.append(timestamp)
-        oxts_data.append(oxts)
-
-        # print(pseudo_image)
-
-        output_path = os.path.join(output_dir, f"pseudo_image_{i}.png")
-        torchvision.utils.save_image(pseudo_image, output_path)
-
-        i += 1
-
-    
-    # Stack the point clouds and other data to create a batch
-    # Now point_clouds is a list of tensors of shape [3, 224, 224]
-    point_clouds = torch.stack(point_clouds)  # Shape: [B, 3, 224, 224]
-    rgb_frames = torch.stack(rgb_frames)
-    oxts_data = torch.stack(oxts_data)
-
-    # Print final shapes to ensure correctness
-    #print(f"Final point clouds batch shape: {point_clouds.shape}")
-    
-    return point_clouds, rgb_frames, timestamps, oxts_data
-'''
-def collate_fn(batch):
-
-    filtered_batch = [sample for sample in batch if sample[-1][-1].item() != -1]
-    if len(filtered_batch) == 0:
-        return None
-
-    point_clouds, rgb_frames, timestamps, oxts_data = [], [], [], []
-    output_dir = "pseudo_images"
-    i = 0
-
-    for point_cloud, rgb_frame, timestamp, oxts in filtered_batch:
-        #print("OXTS sample:", oxts)
-        pseudo_image = lidar_to_histogram_features(point_cloud)
-        # Debug: print the min/max values and shape of the pseudo_image
-        #print(f"Sample {i} pseudo_image: min={pseudo_image.min()}, max={pseudo_image.max()}, shape={pseudo_image.shape}")
-        
-        # Optionally, if you expect a certain size (e.g., [3,224,224]) but the histogram is larger,
-        # you can resize the image. For example:
-        # import torchvision.transforms.functional as TF
-        # pseudo_image = TF.resize(torch.tensor(pseudo_image), [224, 224]).numpy()
-        
-        pseudo_image = torch.tensor(pseudo_image)  # Convert to tensor
-        pseudo_image = TF.resize(pseudo_image.unsqueeze(0), size=[224, 224], interpolation=TF.InterpolationMode.BILINEAR).squeeze(0)
-
-        point_clouds.append(pseudo_image)
-        rgb_frames.append(rgb_frame)
-        timestamps.append(timestamp)
-        oxts_data.append(oxts)
-
-        output_path = os.path.join(output_dir, f"pseudo_image_{i}.png")
-        torchvision.utils.save_image(pseudo_image, output_path)
-        i += 1
-
-    # Stack tensors
-    point_clouds = torch.stack(point_clouds)  # Expected shape: [B, 3, H, W]
-    rgb_frames = torch.stack(rgb_frames)
-    oxts_data = torch.stack(oxts_data)
-    return point_clouds, rgb_frames, timestamps, oxts_data
-
-
-def train_one_epoch(train_data_loader, model, optimizer, loss_fn, device, args):
-    epoch_loss = []
-    sum_correct_pred = 0
-    total_samples = 0
-
+def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch, print_freq=50):
     model.train()
-    scaler = GradScaler()  # Gradient scaler for mixed precision
+    running_loss = 0.0
+    processed_samples = 0
 
-    # Wrap the data loader with tqdm for progress bar
-    progress_bar = tqdm(enumerate(train_data_loader), total=len(train_data_loader), desc="Training", leave=False)
-    
-    
-    for batch_idx, (point_clouds, rgb_frames, _, oxts_data) in progress_bar:
-        # Move data to device
-        point_clouds = point_clouds.to(device)
-        rgb_frames = rgb_frames.to(device)
-        oxts_data = oxts_data.to(device)
-        
+    for i, batch in enumerate(dataloader):
+        images = batch['image'].to(device)
+        pseudo_images = batch['pseudo_image'].to(device)
+        labels = batch['label'].to(device)
+        # sample_indices = batch['sample_idx'] # Not used in training directly
+
+        # AVmodel expects RGB input as [B, T, C, H, W]. Our Dataloader gives [B, C, H, W].
+        # Add a time dimension T=1.
+        images_t = images.unsqueeze(1)
+
         optimizer.zero_grad()
 
-        # Run the model in full precision (FP32) by NOT using autocast
-        preds = model(point_clouds, rgb_frames)
-        labels = oxts_data[:, -1].long().to(device)
-        if labels.min().item() < 0 or labels.max().item() >= args.num_classes:
-            tqdm.write(f"Invalid labels detected: min={labels.min().item()}, max={labels.max().item()}")
-        _loss = loss_fn(preds, labels)
-        
-        # Optionally print if loss is NaN
-        if torch.isnan(_loss):
-            print("Loss is NaN!")
-        
-        _loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        outputs = model(pc=pseudo_images, rgb=images_t)
+        loss = criterion(outputs, labels)
+
+        loss.backward()
         optimizer.step()
 
-        epoch_loss.append(_loss.item())
-        sum_correct_pred += (torch.argmax(preds, dim=1) == labels).sum().item()
-        total_samples += len(labels)
+        running_loss += loss.item() * images.size(0)
+        processed_samples += images.size(0)
 
-        progress_bar.set_postfix(loss=np.mean(epoch_loss))
+        if (i + 1) % print_freq == 0:
+            avg_loss = running_loss / processed_samples
+            print(f"Epoch [{epoch+1}], Batch [{i+1}/{len(dataloader)}], Loss: {avg_loss:.4f}")
 
-    
+    epoch_loss = running_loss / len(dataloader.dataset)
+    return epoch_loss
 
-    '''
-    for batch_idx, (point_clouds, rgb_frames, _, oxts_data) in progress_bar:
-        # Move data to device
-        point_clouds = point_clouds.to(device)
-        rgb_frames = rgb_frames.to(device)
-        oxts_data = oxts_data.to(device)
-        
-        optimizer.zero_grad()
-
-
-        # with autocast():
-        #     preds = model(point_clouds, rgb_frames)
-        #     labels = oxts_data[:, -5].long().to(device)  # Ensure labels are on the correct device
-        #     if labels.min().item() < 0 or labels.max().item() >= 28:
-        #         tqdm.write(f"Invalid labels detected: min={labels.min().item()}, max={labels.max().item()}")
-
-        #     # _loss = loss_fn(preds, labels).to(device)
-        #     _loss = loss_fn(preds, labels)
-
-        with autocast():
-            preds = model(point_clouds, rgb_frames)
-            # Debug: check if preds contain NaNs or are extremely large
-            if torch.isnan(preds).any():
-                print("NaN detected in model predictions!")
-            max_val = preds.abs().max().item()
-            if max_val > 1e4:
-                print("Model predictions are very large:", max_val)
-            labels = oxts_data[:, -1].long().to(device)
-            if labels.min().item() < 0 or labels.max().item() >= args.num_classes:
-                tqdm.write(f"Invalid labels detected: min={labels.min().item()}, max={labels.max().item()}")
-            _loss = loss_fn(preds, labels)
-
-
-        scaler.scale(_loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-
-        epoch_loss.append(_loss.item())
-        sum_correct_pred += (torch.argmax(preds, dim=1) == labels).sum().item()
-        total_samples += len(labels)
-
-        # Update tqdm's progress bar with current metrics
-        progress_bar.set_postfix(loss=np.mean(epoch_loss))
-    '''
-    
-    acc = round(sum_correct_pred / total_samples, 5) * 100
-    return np.mean(epoch_loss), acc
-
-
-def val_one_epoch(val_data_loader, model, loss_fn, device):
-    epoch_loss = []
-    sum_correct_pred = 0
+def validate(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct_predictions_exact_match = 0
     total_samples = 0
 
-    model.eval()
-
-    # Wrap the validation data loader with tqdm for progress bar
-    progress_bar = tqdm(val_data_loader, total=len(val_data_loader), desc="Validation", leave=False)
-    
     with torch.no_grad():
-        for point_clouds, rgb_frames, _, oxts_data in progress_bar:
-            point_clouds = point_clouds.to(device)
-            rgb_frames = rgb_frames.to(device)
-            oxts_data = oxts_data.to(device)
+        for batch in dataloader:
+            images = batch['image'].to(device)
+            pseudo_images = batch['pseudo_image'].to(device)
+            labels = batch['label'].to(device)
 
-            preds = model(point_clouds, rgb_frames)
-            labels = oxts_data[:, -1].long()
-            _loss = loss_fn(preds, labels)
+            images_t = images.unsqueeze(1)
 
-            if torch.isnan(_loss):
-                print("Loss is NaN!")
+            outputs = model(pc=pseudo_images, rgb=images_t)
+            loss = criterion(outputs, labels)
 
-            epoch_loss.append(_loss.item())
-            sum_correct_pred += (torch.argmax(preds, dim=1) == labels).sum().item()
-            total_samples += len(labels)
+            running_loss += loss.item() * images.size(0)
 
-            progress_bar.set_postfix(loss=np.mean(epoch_loss))
-            progress_bar.refresh()
-    
-    acc = round(sum_correct_pred / total_samples, 5) * 100
-    return np.mean(epoch_loss), acc
+            # For multi-label accuracy (exact match ratio)
+            probs = torch.sigmoid(outputs)
+            preds = (probs > 0.5).float()
+            correct_predictions_exact_match += (preds == labels).all(dim=1).sum().item()
+            total_samples += labels.size(0)
+
+    val_loss = running_loss / len(dataloader.dataset)
+    val_accuracy_emr = correct_predictions_exact_match / total_samples if total_samples > 0 else 0.0
+    return val_loss, val_accuracy_emr
+
+def main(args):
+    device = torch.device("cuda" if torch.cuda.is_available() and args.use_cuda else "cpu")
+    print(f"Using device: {device}")
+
+    # --- Datasets and DataLoaders ---
+    # Using default transforms from KITTIDataset if not overridden
+    # You might want to define specific transforms for train and val
+    train_dataset = KITTIDataset(root_path=args.dataset_root, split='train')
+    val_dataset = KITTIDataset(root_path=args.dataset_root, split='val') # Assuming a 'val' split exists
+
+    print(f"Training dataset size: {len(train_dataset)}")
+    print(f"Validation dataset size: {len(val_dataset)}")
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        print("Error: One or both datasets are empty. Please check your dataset path and .pkl files.")
+        return
+
+    num_classes = train_dataset.num_classes
+    class_names = train_dataset.get_class_names()
+    print(f"Number of classes: {num_classes}")
+    print(f"Class names: {class_names}")
 
 
-def train_test(args):
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    dataset = KITTIMultiDriveDataset(root_dir=args.data_root)
-    
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # --- Model ---
+    # AVmodel(num_classes, num_latents, dim=768, vit_model_name='vit_base_patch16_224', adaptformer_blocks=12)
+    # dim, vit_model_name, adaptformer_blocks are defaults in your model.py
+    model = AVmodel(num_classes=num_classes, num_latents=args.num_latents, dim=args.dim).to(device)
+    print(f"Model AVmodel initialized with num_classes={num_classes}, num_latents={args.num_latents}, dim={args.dim}.")
+    # You can print model summary here if desired: print(model)
 
-    trainloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        collate_fn=collate_fn,
-        shuffle=True,
-        num_workers=0  # Avoid multiprocessing issues
-    )
+    # --- Loss Function ---
+    # For multi-label classification with logits output and multi-hot labels
+    criterion = nn.BCEWithLogitsLoss()
 
-    valloader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        collate_fn=collate_fn,
-        shuffle=False,
-        num_workers=0  # Avoid multiprocessing issues
-    )
+    # --- Optimizer ---
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    model = AVmodel(num_classes=args.num_classes, num_latents=args.num_latent, dim=args.adapter_dim)
-    model.to(args.device)
-    print("\t Model Loaded")
-    print('\t Trainable params = ', sum(p.numel() for p in model.parameters() if p.requires_grad))
+    # --- Learning Rate Scheduler (Optional) ---
+    # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+    # --- Training Loop ---
+    best_val_loss = float('inf')
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    best_val_acc = []
-    num_epochs = args.num_epochs
+    print(f"\nStarting training for {args.epochs} epochs...")
+    for epoch in range(args.epochs):
+        start_time = time.time()
 
-    # Wrap the epoch loop with tqdm
-    for epoch in tqdm(range(num_epochs), desc="Epochs"):
-        torch.cuda.empty_cache()  # Clear memory before each epoch
-        loss, acc = train_one_epoch(trainloader, model, optimizer, loss_fn, args.device, args)
-        val_loss, val_acc = val_one_epoch(valloader, model, loss_fn, args.device)
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, print_freq=args.print_freq)
+        val_loss, val_accuracy_emr = validate(model, val_loader, criterion, device)
 
-        print('\nEpoch:', epoch + 1)
-        print("Training loss & accuracy:", round(loss, 4), round(acc, 3))
-        print("Validation loss & accuracy:", round(val_loss, 4), round(val_acc, 3))
-        best_val_acc.append(val_acc)
+        # if scheduler:
+        #     scheduler.step()
 
-    print("\n\t Completed Training \n")  
-    print("\t Best Results:", np.max(np.asarray(best_val_acc)))
+        epoch_duration = time.time() - start_time
+        print(f"-"*50)
+        print(f"Epoch [{epoch+1}/{args.epochs}] - Duration: {epoch_duration:.2f}s")
+        print(f"  Train Loss: {train_loss:.4f}")
+        print(f"  Val Loss: {val_loss:.4f} | Val EMR Accuracy: {val_accuracy_emr:.4f}")
+        print(f"-"*50)
+
+        # Save checkpoint
+        checkpoint_path = os.path.join(args.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pth")
+        torch.save({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': train_loss,
+            'val_loss': val_loss,
+            'val_accuracy_emr': val_accuracy_emr
+        }, checkpoint_path)
+        print(f"Saved checkpoint: {checkpoint_path}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_path = os.path.join(args.checkpoint_dir, "best_model.pth")
+            torch.save(model.state_dict(), best_model_path)
+            print(f"Saved new best model to {best_model_path} (Val Loss: {best_val_loss:.4f})")
+
+    print("Training finished.")
+
 
 if __name__ == "__main__":
-    opts = parse_options()
-    train_test(args=opts)
+    parser = argparse.ArgumentParser(description="Training script for AVmodel on KITTI.")
+    parser.add_argument('--dataset_root', type=str, required=True, help="Path to the root of the KITTI dataset.")
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help="Directory to save model checkpoints.")
+    parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help="Weight decay for optimizer.")
+    parser.add_argument('--batch_size', type=int, default=4, help="Batch size for training and validation.")
+    parser.add_argument('--epochs', type=int, default=50, help="Number of training epochs.")
+    parser.add_argument('--num_workers', type=int, default=4, help="Number of workers for DataLoader.")
+    parser.add_argument('--num_latents', type=int, default=128, help="Number of latents for AdaptFormer.")
+    parser.add_argument('--dim', type=int, default=768, help="Dimension for features (should match ViT and PointCloudEncoder output).")
+    parser.add_argument('--print_freq', type=int, default=20, help="Frequency of printing training loss (batches).")
+    parser.add_argument('--use_cuda', action='store_true', help="Use CUDA if available (default is to use if available).")
+    # If you don't pass --use_cuda, it will default to False (unless you change the logic),
+    # so the device line `torch.device("cuda" if torch.cuda.is_available() and args.use_cuda else "cpu")`
+    # is a bit redundant with just checking torch.cuda.is_available().
+    # A simpler approach is to let the script auto-detect CUDA and only add a --no_cuda flag if needed.
+    # For now, this setup works: if CUDA is available AND --use_cuda is passed, it uses CUDA.
+    # To make it simpler: remove --use_cuda and just rely on torch.cuda.is_available().
+    # I'll modify the device line to be simpler if --use_cuda is not explicitly used.
 
+    args = parser.parse_args()
+
+    # Simplified device selection (auto-use CUDA if available, unless user specifically wants CPU later via a --cpu flag)
+    if args.use_cuda and not torch.cuda.is_available():
+        print("Warning: --use_cuda specified, but CUDA is not available. Using CPU.")
+        args.use_cuda = False # Fallback to CPU
+    elif not args.use_cuda and torch.cuda.is_available():
+        print("CUDA is available, but --use_cuda was not specified. Using CPU. To use CUDA, pass the --use_cuda flag.")
+
+
+    main(args)
