@@ -131,10 +131,35 @@ def main(args):
 
     # --- Training Loop ---
     best_val_loss = float('inf')
+
+
+    # --- NEW: Logic to resume from checkpoint ---
+    start_epoch = 0
+    best_val_loss = float('inf')
+
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print(f"=> Loading checkpoint '{args.resume}'")
+            # Load checkpoint to the current device
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            # Load best_val_loss to correctly save the next best model
+            best_val_loss = checkpoint.get('val_loss', float('inf')) 
+            
+            print(f"=> Loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
+            print(f"   Resuming training from epoch {start_epoch + 1}")
+        else:
+            print(f"=> ERROR: No checkpoint found at '{args.resume}'. Starting from scratch.")
+    # --- End of new logic ---
+
+
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     print(f"\nStarting training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
 
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, print_freq=args.print_freq)
@@ -175,6 +200,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Training script for AVmodel on KITTI.")
     parser.add_argument('--dataset_root', type=str, required=True, help="Path to the root of the KITTI dataset.")
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help="Directory to save model checkpoints.")
+    parser.add_argument('--resume', type=str, default=None, help="Path to the checkpoint to resume training from.") # NEW
     parser.add_argument('--lr', type=float, default=1e-4, help="Learning rate.")
     parser.add_argument('--weight_decay', type=float, default=1e-5, help="Weight decay for optimizer.")
     parser.add_argument('--batch_size', type=int, default=4, help="Batch size for training and validation.")
